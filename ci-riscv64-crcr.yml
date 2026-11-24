@@ -1,0 +1,143 @@
+name: PyTorch RISC-V CRCR CI
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Upstream pytorch/pytorch PR number
+        required: true
+        type: string
+      total_shards:
+        description: Number of core-test shards
+        default: "4"
+        required: true
+        type: string
+      test_suite:
+        description: Test selection
+        default: core
+        required: true
+        type: choice
+        options: [core, full]
+  repository_dispatch:
+    types: [pytorch-upstream-pr-ci]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.pr_number || github.event.client_payload.pr_number || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  jenkins-ci:
+    name: pytorch-riscv64-jenkins-ci
+    runs-on: [self-hosted, linux, amd64]
+    environment: riscv64
+    timeout-minutes: 850
+
+    steps:
+      - name: Resolve Jenkins parameters
+        id: params
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_PR_NUMBER: ${{ inputs.pr_number }}
+          INPUT_TOTAL_SHARDS: ${{ inputs.total_shards }}
+          INPUT_TEST_SUITE: ${{ inputs.test_suite }}
+          DISPATCH_PR_NUMBER: ${{ github.event.client_payload.pr_number }}
+          DISPATCH_TOTAL_SHARDS: ${{ github.event.client_payload.total_shards }}
+          DISPATCH_TEST_SUITE: ${{ github.event.client_payload.test_suite }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$EVENT_NAME" == "repository_dispatch" ]]; then
+            NUMBER=$DISPATCH_PR_NUMBER
+            TOTAL_SHARDS=${DISPATCH_TOTAL_SHARDS:-4}
+            TEST_SUITE=${DISPATCH_TEST_SUITE:-core}
+          else
+            NUMBER=$INPUT_PR_NUMBER
+            TOTAL_SHARDS=$INPUT_TOTAL_SHARDS
+            TEST_SUITE=$INPUT_TEST_SUITE
+          fi
+
+          [[ "$NUMBER" =~ ^[1-9][0-9]*$ ]]
+          [[ "$TOTAL_SHARDS" =~ ^[1-9][0-9]*$ ]]
+          [[ "$TEST_SUITE" =~ ^(core|full)$ ]]
+
+          PR_JSON=$(curl --fail --silent --show-error --location \
+            --retry 5 \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/pytorch/pytorch/pulls/$NUMBER")
+
+          BASE_SHA=$(jq -r '.base.sha' <<< "$PR_JSON")
+          HEAD_SHA=$(jq -r '.head.sha' <<< "$PR_JSON")
+          [[ "$BASE_SHA" =~ ^[0-9a-fA-F]{40}$ ]]
+          [[ "$HEAD_SHA" =~ ^[0-9a-fA-F]{40}$ ]]
+
+          echo "base_sha=$BASE_SHA" >> "$GITHUB_OUTPUT"
+          echo "head_sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+          echo "pr_number=$NUMBER" >> "$GITHUB_OUTPUT"
+          echo "total_shards=$TOTAL_SHARDS" >> "$GITHUB_OUTPUT"
+          echo "test_suite=$TEST_SUITE" >> "$GITHUB_OUTPUT"
+
+      - name: Trigger Jenkins and stream results
+        id: jenkins
+        shell: bash
+        env:
+          TOKEN: ${{ secrets.JENKINS_API_TOKEN }}
+          TOTAL_SHARDS: ${{ steps.params.outputs.total_shards }}
+          TEST_SUITE: ${{ steps.params.outputs.test_suite }}
+        run: |
+          set -euo pipefail
+
+          set +e
+          bash /home/jenkins/scripts/jenkins-run-crcr.sh \
+            "${{ steps.params.outputs.base_sha }}" \
+            "${{ steps.params.outputs.head_sha }}" \
+            "${{ steps.params.outputs.pr_number }}" \
+            "$TOTAL_SHARDS" \
+            0 \
+            "$TEST_SUITE" \
+            wheel | tee jenkins.log
+          JENKINS_RC=${PIPESTATUS[0]}
+          set -e
+
+          CI_STAT_URL=$(grep -oE 'https://[^ ]+/pytorch-ci-stat\.json' jenkins.log | tail -n1 || true)
+          CORE_STAT_URL=$(grep -oE 'https://[^ ]+/pytorch-core-ci-stat\.json' jenkins.log | tail -n1 || true)
+          if [ -z "$CI_STAT_URL" ] || [ -z "$CORE_STAT_URL" ]; then
+            echo "ERROR: Jenkins did not publish both result URLs" >&2
+            echo "jenkins-run-crcr.sh rc=$JENKINS_RC" >&2
+            exit 1
+          fi
+
+          echo "ci_stat_url=$CI_STAT_URL" >> "$GITHUB_OUTPUT"
+          echo "core_stat_url=$CORE_STAT_URL" >> "$GITHUB_OUTPUT"
+
+      - name: Validate CI result
+        shell: bash
+        env:
+          CI_STAT_URL: ${{ steps.jenkins.outputs.ci_stat_url }}
+          CORE_STAT_URL: ${{ steps.jenkins.outputs.core_stat_url }}
+        run: |
+          set -euo pipefail
+
+          curl --fail --silent --show-error --location --retry 5 \
+            --output ci-stat.json "$CI_STAT_URL"
+          curl --fail --silent --show-error --location --retry 5 \
+            --output core-stat.json "$CORE_STAT_URL"
+
+          PASSED=$(jq -r '.summary.PASSED // 0' ci-stat.json)
+          FAILED=$(jq -r '.failed | length' ci-stat.json)
+          CORE_FAILED=$(jq -r '.failed | length' core-stat.json)
+
+          if [ "$PASSED" -eq 0 ] || [ "$FAILED" -ne 0 ] || [ "$CORE_FAILED" -ne 0 ]; then
+            echo "ERROR: passed=$PASSED failed=$FAILED core_failed=$CORE_FAILED" >&2
+            jq '.failed' ci-stat.json
+            jq '.failed' core-stat.json
+            exit 1
+          fi
+
+          echo "CI succeeded: $PASSED tests passed and no tests failed"
